@@ -1,0 +1,1131 @@
+# -*- coding: utf-8 -*-
+"""AIfNTass1_Britt_Marti.ipynb
+
+Original file is located at
+    https://colab.research.google.com/drive/1RtY8cPPgBk3LubId4vAUXqGDapxeJJVe
+
+# Practical on HYperrealistic neural coding of PERception (HYPER)
+
+In this practical, you will get hands-on experience with neural encoding and neural decoding via a GAN latent space. You will be working in the same groups as the ones you did the presentations and the deadline is: May 30th, Friday. You can get a total of 80 points which translates to 20% (or 2/10) of your total grade for the course.
+
+### Reminder! The workgroups for this assignment, where you can ask questions to the TAs are: 16th May -Friday-, 23rd May -Friday- and 26th May -Monday!!!-. The practical on 26th May will happen in MM 2.130, the same classroom as the lectures take place.
+
+The practical consists of the following parts:
+
+1.   PGGAN
+2.   Dataset
+3.   Neural encoding
+4.   Neural decoding
+5.   Your own experiment
+
+We provide you with the MXNET implementation of NVIDIA's progressively grown generative adversarial network (PGGAN) generator network for face generation that was used in [the paper](https://www.nature.com/articles/s41598-021-03938-w).
+
+In the first and second part, you will familiarize yourselves with PGGAN and the (stimulus, response) dataset. In the third and fourth part, you will implement neural encoding (face2brain) and neural decoding (brain2face) pipelines. In the last part, you will conduct your own experiment that you will write an "ultra-short" report on.
+
+⚠️ Beware! You cannot edit this document. Go to 'File/Save a copy in Drive' to work on a version specific to you which you can edit to your heart's content.
+
+## Note for the initial steps
+The following code is a necessary step for some of the libraries required for this assignment to work. Unfortunately, you will have to run these blocks every time you disconnect from the session, meaning that you will need approximately 10 minutes. We apologize for this inconvinence.
+
+The blocks below are for housekeeping and they install, download, load, define, and do a bit more. That being said, understanding them is not the focus of this assignment, so also feel free to just run them and be done with it.
+
+Make sure that your google colab runtime is using a GPU (Runtime → Change runtime type).
+"""
+
+# STEP 1: Remove existing CUDA and cuDNN
+!apt-get purge -y "*cublas*" "*cufft*" "*curand*" "*cusolver*" "*cusparse*" "*npp*" "*nvjpeg*" "cuda*" "nsight*"
+!rm -rf /usr/local/cuda*
+
+# STEP 2: Install CUDA 11.2
+!wget https://developer.download.nvidia.com/compute/cuda/11.2.2/local_installers/cuda_11.2.2_460.32.03_linux.run
+!chmod +x cuda_11.2.2_460.32.03_linux.run
+!./cuda_11.2.2_460.32.03_linux.run --silent --toolkit --override
+
+# STEP 3: Install cuDNN 8.1 for CUDA 11.2
+!wget https://developer.download.nvidia.com/compute/redist/cudnn/v8.1.1/cudnn-11.2-linux-x64-v8.1.1.33.tgz
+!tar -xzvf cudnn-11.2-linux-x64-v8.1.1.33.tgz
+!cp cuda/include/cudnn*.h /usr/local/cuda/include/
+!cp cuda/lib64/libcudnn* /usr/local/cuda/lib64/
+!chmod a+r /usr/local/cuda/include/cudnn*.h /usr/local/cuda/lib64/libcudnn*
+
+# STEP 4: Add CUDA to dynamic linker config
+!echo "/usr/local/cuda/lib64" > /etc/ld.so.conf.d/cuda.conf
+!ldconfig
+
+# STEP 5: Install compatible NumPy
+!pip install numpy==1.23.5 --force-reinstall
+
+"""# STEP 6: Now restart the session
+
+> Runtime > Restart Session
+
+This clears all Python modules, ensuring a clean environment where numpy==1.23.5 is respected
+"""
+
+# STEP 7: Set environment variables
+import os
+os.environ['CUDA_HOME'] = '/usr/local/cuda-11.2'
+os.environ['PATH'] = '/usr/local/cuda-11.2/bin:' + os.environ['PATH']
+os.environ['LD_LIBRARY_PATH'] = '/usr/local/cuda-11.2/lib64'
+
+# STEP 8: Install MXNet and other libraries
+!pip install mxnet-cu112
+!pip install nibabel nilearn tqdm
+
+# STEP 9: Test MXNet GPU support
+import mxnet as mx
+print("MXNet version:", mx.__version__)
+print("GPUs available:", mx.test_utils.list_gpus())
+
+"""The block below is defining where all of the data and files are being stored that you'll generate and download within this notebook. Per default, it stores everything in the temporary runtime of google colab, which means all files are being deleted when the runtime ends. This is enough to run it, create all the output and then (later) download it to submit it.
+However, if you have downloaded this notebook to run it locally, or wish to save files to your google drive folder for safekeeping, you will need to make changes to the block as outlined in the comments.
+"""
+
+from pathlib import Path
+
+# all downloaded files will be stored here. This works great in the colab environment
+# although all of your files will be deleted when you end the colab session
+# if you want to run this code locally, you might want to change this to a more suited path
+# e.g. "." to save in the current directory
+__working_directory = Path("/content/")
+
+# if you want to save the files you are generating to your google drive when running in colab
+# you can uncomment these lines of code
+# from google.colab import drive
+# drive.mount('/content/drive')
+# __working_directory = __working_directory / "drive" / "ai4nt_2425"
+# __working_directory.mkdir(parents=True, exist_ok=True)
+
+__save_location = __working_directory / "downloads/"
+__save_location.mkdir(parents=True, exist_ok=True)
+
+from __future__ import annotations
+
+# import os
+import hashlib
+import io
+import warnings
+import pickle
+import re
+import requests
+from types import ModuleType
+from typing import Tuple, Union
+
+from tqdm.notebook import trange, tqdm
+import matplotlib.pyplot as plt
+import matplotlib.image as img
+from matplotlib import cm
+import numpy as np
+# np.bool = np.bool_ # needs to be here for mx to import. don't question it 🤫
+# import mxnet as mx
+from mxnet import autograd, Context, gluon, nd, symbol
+from mxnet.gluon import loss, nn
+from mxnet.gluon.nn import Conv2D, Dense, HybridBlock, HybridSequential, LeakyReLU
+from mxnet.gluon.parameter import Parameter
+from mxnet.initializer import Zero
+from mxnet.ndarray import NDArray
+from mxnet.io import NDArrayIter
+import nibabel as nib
+from nilearn import plotting
+from PIL import Image
+from scipy.stats import t, zscore
+from sklearn.linear_model import RidgeCV
+
+# helper functions to download and load all the data files spread around the internet
+
+def _url_to_name(url:str) -> str:
+  """Calculates the md5 hash of an url string as a proxy filename"""
+  return hashlib.md5(url.encode()).hexdigest()
+
+def get_drive_file_id_from_share_link(share_url:str) -> str:
+    """From a google drive public sharing link, get the file_id we can use to directly download the file"""
+    return re.match(r".*/d/(?P<file_id>[a-zA-Z0-9-_]+)/?.*", share_url)['file_id']
+
+def make_drive_downloadable_url(file_id:str) -> str:
+    """from a google drive file-id, generate a direct-download link to be used in code"""
+    return r"https://drive.usercontent.google.com/download?id={file_id}&export=download&confirm=y".format(file_id=file_id)
+
+def load_from_url(url:str, name:str=None) -> bytes:
+  """Loads data from a URL and returns the byte response. Implements simple caching"""
+  if name is None:
+    warnings.warn("Consider giving the downloaded file a unique name, to avoid accidental overwriting.", )
+    name = _url_to_name(url)
+  file_path = __save_location / name
+
+  if file_path.is_file():
+    with open(file_path, "rb") as f:
+      res = f.read()
+  else:
+    with requests.get(url) as response:
+      if response.status_code != 200:
+        raise ConnectionError(f"Unsuccessful GET request for: {url}")
+      with open(file_path, "wb") as f:
+        res = response.content
+        f.write(res)
+
+  return res
+
+def get_downloaded_file_path(name:str=None, url:str=None) -> str:
+  """Some libraries deal better with file names than byte streams. Adds access to downloaded files"""
+  if name is None:
+    if url is None:
+      raise ValueError("Name and URL cannot both be None")
+
+    name = _url_to_name(url)
+
+  file_path = __save_location / name
+  if not file_path.is_file():
+    raise FileNotFoundError(f"No file found at {file_path}\nWas it downloaded yet?")
+
+  return str(file_path)
+
+if mx.gpu:
+    ctx = mx.gpu()
+else:
+    ctx = mx.cpu()
+
+print(ctx)
+
+class Pixelnorm(HybridBlock):
+    def __init__(self, epsilon: float = 1e-8) -> None:
+        super(Pixelnorm, self).__init__()
+        self.eps = epsilon
+
+    def hybrid_forward(self, F, x) -> nd:
+        return x * F.rsqrt(F.mean(F.square(x), 1, True) + self.eps)
+
+
+class Bias(HybridBlock):
+    def __init__(self, shape: Tuple) -> None:
+        super(Bias, self).__init__()
+        self.shape = shape
+        with self.name_scope():
+            self.b = self.params.get("b", init=Zero(), shape=shape)
+
+    def hybrid_forward(self, F, x, b) -> nd:
+        return F.broadcast_add(x, b[None, :, None, None])
+
+
+class Block(HybridSequential):
+    def __init__(self, channels: int, in_channels: int) -> None:
+        super(Block, self).__init__()
+        self.channels = channels
+        self.in_channels = in_channels
+        with self.name_scope():
+            self.add(Conv2D(channels, 3, padding=1, in_channels=in_channels))
+            self.add(LeakyReLU(0.2))
+            self.add(Pixelnorm())
+            self.add(Conv2D(channels, 3, padding=1, in_channels=channels))
+            self.add(LeakyReLU(0.2))
+            self.add(Pixelnorm())
+
+    def hybrid_forward(self, F, x) -> nd:
+        x = F.repeat(x, 2, 2)
+        x = F.repeat(x, 2, 3)
+        for i in range(len(self)):
+            x = self[i](x)
+        return x
+
+
+class Generator(HybridSequential):
+    def __init__(self) -> None:
+        super(Generator, self).__init__()
+        with self.name_scope():
+            self.add(Pixelnorm())
+            self.add(Dense(8192, use_bias=False, in_units=512))
+            self.add(Bias((512,)))
+            self.add(LeakyReLU(0.2))
+            self.add(Pixelnorm())
+            self.add(Conv2D(512, 3, padding=1, in_channels=512))
+            self.add(LeakyReLU(0.2))
+            self.add(Pixelnorm())
+            self.add(Block(512, 512))
+            self.add(Block(512, 512))
+            self.add(Block(512, 512))
+            self.add(Block(256, 512))
+            self.add(Block(128, 256))
+            self.add(Block(64, 128))
+            self.add(Block(32, 64))
+            self.add(Block(16, 32))
+            self.add(Conv2D(3, 1, in_channels=16))
+
+    def hybrid_forward(self, F: Union(nd, symbol), x: nd, layer: int) -> nd:
+        x = F.Reshape(self[1](self[0](x)), (-1, 512, 4, 4))
+        for i in range(2, len(self)):
+            x = self[i](x)
+            if i == layer + 7:
+                return x
+        return x
+
+# download pretrained model parameters and store them at `param_path`
+generator_params_file_id = r"1yT8XomOacOGNZq2CEpvJlxQSeECNhstg"
+_ = load_from_url(make_drive_downloadable_url(generator_params_file_id), name="generator.params")
+param_path = get_downloaded_file_path(name="generator.params")
+
+# initialise the generator
+generator = Generator()
+generator.load_parameters(param_path, ctx=ctx)
+
+"""# PART 1: PGGAN
+
+## Exercise 1: Latent2Face (1 point)
+The latent input of PGGAN's generator consists of 512-dimensional hyperspheres where each dimension is independently Gaussian distributed with unit variance.
+
+Your task is to sample a random latent vector, generate a face by feeding it to the generator, and plotting it using matplotlib.
+
+The model expects an input of type [NDArray](https://mxnet.apache.org/versions/1.0.0/api/python/ndarray/ndarray.html) and a layer of type int (choose the last layer=9 if you want the generator to return the face image).
+
+If you are using GPU, don't forget to specify this when converting your input to NDArray, by using `as_in_context`.
+"""
+
+### your code here
+latent = np.random.randn(1, 512).astype("float32")
+
+# generate the image from the latent input
+face = generator(nd.array(latent).as_in_context(ctx), 9).asnumpy()
+# scale from [0,1] colour values to [0,255] integer (np.rint) colour values
+# the values are clipped to 0 and 255 to ensure they are within legal bounds
+face = np.clip(np.rint(127.5 * face + 127.5), 0.0, 255.0)
+# reorder the axes from GBR to RGB
+face = face.astype("uint8").transpose(0, 2, 3, 1)
+
+plt.figure()
+plt.imshow(face[0])
+plt.axis("off")
+plt.show()
+
+"""## Exercise 2: Spherical linear interpolation (1 point)
+
+The GAN latent space has learned smooth transitions that can be visualized by linear interpolation. Because the latent space is a multimodal Gaussian distribution, the "spherical" linear interpolation function $Slerp$ should be used used to take the latents' spherical geometry into account (rather than regular linear interpolation):
+
+\begin{equation}
+    Slerp(z_1, z_2, n) = \frac{\sin \big[ (1-n) \Omega \big] }{\sin \Omega} z_1 + \frac{\sin \big[n \Omega \big] }{\sin \Omega} z_2
+\end{equation}
+
+where $\Omega$ is the subtended angle which you can compute by taking the dot product of the unit vectors of $z_1$ and $z_2$. That is, $\cos \Omega = \dfrac{z_1 \cdot z_2}{||z_1||*||z_2||}$. Next, $n$ is the interpolation ratio that you can get using <code>np.linspace(0, 1, N)</code> where $N$ is the step size.
+
+First, implement the $Slerp$ function which should return a latent vector. Then, sample two random latents $z_1$ and $z_2$ and use $Slerp$ to obtain N latents which you can feed to the generator to synthesize $N$ face images that transition smoothly from $z_1$ into $z_2$.
+
+<font color= "green">
+Answer:
+
+
+</font>
+"""
+
+def slerp(N, z1, z2):
+    """
+    Compute the spherical linear interpolation (SLERP) between two vectors in the latent space.
+
+    Parameters:
+    N (int): The number of intermediate latent vectors to generate.
+    z1 (ndarray): The first latent vector (Numpy array of shape (latent_dim,)).
+    z2 (ndarray): The second latent vector (Numpy array of shape (latent_dim,)).
+
+    Returns:
+    slerp_latents (ndarray): An array of shape (N, latent_dim) containing the interpolated latent vectors
+                             from z1 to z2, including the endpoints.
+    """
+
+        # Normalize the vectors
+    z1_norm = z1 / np.linalg.norm(z1)
+    z2_norm = z2 / np.linalg.norm(z2)
+
+    # Compute the angle (omega) between them
+    dot = np.clip(np.dot(z1_norm, z2_norm), -1.0, 1.0)  # clip for numerical stability
+    omega = np.arccos(dot)
+
+    # Handle case when omega is very small (vectors nearly identical)
+    if np.isclose(omega, 0):
+        return np.linspace(z1, z2, N)
+
+    # Interpolation ratios
+    t_vals = np.linspace(0, 1, N)
+
+    slerp_latents = []
+    for t in t_vals:
+        part1 = np.sin((1 - t) * omega) / np.sin(omega) * z1
+        part2 = np.sin(t * omega) / np.sin(omega) * z2
+        slerp_latents.append(part1 + part2)
+
+    return np.array(slerp_latents)
+
+### Your code here
+# Sample z1 and z2
+z1 = np.random.randn(512).astype('float32')
+z2 = np.random.randn(512).astype('float32')
+
+# Interpolate
+latents = slerp(10, z1, z2)
+
+# Generate face for every step
+for latent in latents:
+    face = generator(nd.array(latent[np.newaxis, :]).as_in_context(ctx), 9).asnumpy()
+    face = np.clip(np.rint(127.5 * face + 127.5), 0.0, 255.0).astype("uint8").transpose(0, 2, 3, 1)
+    plt.imshow(face[0])
+    plt.axis("off")
+    plt.show()
+
+"""**What does the $Slerp$ function look like in the limit as $\Omega \to 0$?**
+
+In the limit as Omega → 0, the two vectors become nearly identical, and the SLERP function approaches linear interpolation (LERP). This is because the curved path on the hypersphere becomes indistinguishable from a straight line, and the SLERP formula simplifies to:
+
+(1 - n) * z1 + n * z2
+
+## Exercise 3: Vector arithmetic (1 point)
+
+In the previous exercise, you have seen how image semantics vary with the latent code. The GAN latent space also obeys simple arithmetic operations, such as:
+
+$\texttt{SmilingWoman - NeutralWoman + NeutralMan = SmilingMan}$
+
+Sample and reconstruct a large number of faces. From these faces, select a bunch that correspond to each of the above three categories (i.e., 20 smiling women, 20 neutral women, 20 neutral men). Average the latents per category and perform the arithmetic operations with these averaged latents to obtain a smiling man. If you are feeling creative, feel free to pick any other arithmetic operation instead of the given one.
+
+At the end, you should have a 4 panel figure which shows the faces that go in your operation and the face that comes out.
+"""
+
+# Parameters
+N = 100  # Number of samples
+latent_dim = 512
+
+# Storage
+sampled_latents = []
+generated_faces = []
+
+# Generate latent vectors and corresponding images
+for _ in range(N):
+    latent = np.random.randn(latent_dim).astype("float32")
+    latent_batch = latent[np.newaxis, :]
+
+    face = generator(nd.array(latent_batch).as_in_context(ctx), 9).asnumpy()
+    face = np.clip(np.rint(127.5 * face + 127.5), 0.0, 255.0).astype("uint8").transpose(0, 2, 3, 1)[0]
+
+    sampled_latents.append(latent)
+    generated_faces.append(face)
+
+# Convert to arrays for indexing
+sampled_latents = np.array(sampled_latents)
+generated_faces = np.array(generated_faces)
+
+# Show in grid with indices
+def show_face_grid(images, cols=6):
+    rows = int(np.ceil(len(images) / cols))
+    fig, axes = plt.subplots(rows, cols, figsize=(3*cols, 3*rows))
+    for idx, ax in enumerate(axes.flat):
+        if idx < len(images):
+            ax.imshow(images[idx])
+            ax.set_title(f"{idx}", fontsize=12)
+        ax.axis("off")
+    plt.tight_layout()
+    plt.show()
+
+show_face_grid(generated_faces)
+
+# Manually picked faces
+neutral_men_ids = [0, 3, 23, 20, 28]
+neutral_women_ids = [10, 6, 7, 24,27]
+smiling_women_ids = [15, 18, 19, 26, 84]
+
+latents_smiling_women = sampled_latents[smiling_women_ids]
+latents_neutral_women = sampled_latents[neutral_women_ids]
+latents_neutral_men   = sampled_latents[neutral_men_ids]
+
+mean_smiling_woman = np.mean(latents_smiling_women, axis=0)
+mean_neutral_woman = np.mean(latents_neutral_women, axis=0)
+mean_neutral_man   = np.mean(latents_neutral_men, axis=0)
+
+# Vector arithmetic
+smiling_man_latent = mean_smiling_woman - mean_neutral_woman + mean_neutral_man
+
+# Function to generate face from latent
+def generate_face(latent_vector):
+    latent_input = latent_vector[np.newaxis, :]
+    face = generator(nd.array(latent_input).as_in_context(ctx), 9).asnumpy()
+    face = np.clip(np.rint(127.5 * face + 127.5), 0.0, 255.0).astype("uint8").transpose(0, 2, 3, 1)[0]
+    return face
+
+# Generate all four
+img_smiling_woman = generate_face(mean_smiling_woman)
+img_neutral_woman = generate_face(mean_neutral_woman)
+img_neutral_man   = generate_face(mean_neutral_man)
+img_smiling_man   = generate_face(smiling_man_latent)
+
+# Plot the 4-panel figure
+fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+titles = ["Smiling Woman", "Neutral Woman", "Neutral Man", "Smiling Man"]
+images = [img_smiling_woman, img_neutral_woman, img_neutral_man, img_smiling_man]
+
+for ax, img, title in zip(axes, images, titles):
+    ax.imshow(img)
+    ax.set_title(title)
+    ax.axis("off")
+
+plt.tight_layout()
+plt.show()
+
+"""## Exercise 4: Semantic face editing (1 point)
+
+In [this paper](https://arxiv.org/pdf/1907.10786.pdf), five decision boundaries are identified for five binary semantic attributes: gender, age, eyeglasses, pose and smile. A face can be edited by editing its underlying latent $z$:
+
+\begin{equation}
+    z_{edit} = z + \alpha \textbf{b}
+\end{equation}
+
+where $\alpha$'s magnitude and polarity represent the amount of change and direction, respectively, along the separation boundary $\textbf{b}$.
+
+Pick a decision boundary for PGGAN from [their Github](https://github.com/genforce/interfacegan/tree/master/boundaries) and perform semantic face editing on a randomly sampled latent as follows: define a linspace of $n$ $\alpha$'s (E.g., <code>np.linspace(-3, 3, 10)</code> if $n=10$ from $-3$ to $3$) and subtract the dot product between latent and boundary from each element in this linspace. Finally, edit the original latent by adding each $\alpha \textbf{b}$ (as in the equation above) and visualize the $n$ corresponding faces.
+
+We already collected all of the boundary URLs in the block below to make it easier to load and switch once you had a look at the GitHub and decided which one you want to use, or play around with several.
+"""
+
+age_boundary_url = r"https://github.com/genforce/interfacegan/blob/master/boundaries/pggan_celebahq_age_boundary.npy?raw=true"
+age_c_eyeglasses_boundary_url = r"https://github.com/genforce/interfacegan/blob/master/boundaries/pggan_celebahq_age_c_eyeglasses_boundary.npy?raw=true"
+age_c_gender_boundary_url = r"https://github.com/genforce/interfacegan/blob/master/boundaries/pggan_celebahq_age_c_gender_boundary.npy?raw=true"
+age_c_gender_eyeglasses_boundary_url = r"https://github.com/genforce/interfacegan/blob/master/boundaries/pggan_celebahq_age_c_gender_eyeglasses_boundary.npy?raw=true"
+eyeglasses_boundary_url = r"https://github.com/genforce/interfacegan/blob/master/boundaries/pggan_celebahq_eyeglasses_boundary.npy?raw=true"
+eyeglasses_c_age_boundary_url = r"https://github.com/genforce/interfacegan/blob/master/boundaries/pggan_celebahq_eyeglasses_c_age_boundary.npy?raw=true"
+eyeglasses_c_age_gender_boundary_url = r"https://github.com/genforce/interfacegan/blob/master/boundaries/pggan_celebahq_eyeglasses_c_age_gender_boundary.npy?raw=true"
+eyeglasses_c_gender_boundary_url = r"https://github.com/genforce/interfacegan/blob/master/boundaries/pggan_celebahq_eyeglasses_c_gender_boundary.npy?raw=true"
+gender_boundary_url = r"https://github.com/genforce/interfacegan/blob/master/boundaries/pggan_celebahq_gender_boundary.npy?raw=true"
+gender_c_age_boundary_url = r"https://github.com/genforce/interfacegan/blob/master/boundaries/pggan_celebahq_gender_c_age_boundary.npy?raw=true"
+gender_c_age_eyeglasses_boundary_url = r"https://github.com/genforce/interfacegan/blob/master/boundaries/pggan_celebahq_gender_c_age_eyeglasses_boundary.npy?raw=true"
+gender_c_eyeglasses_boundary_url = r"https://github.com/genforce/interfacegan/blob/master/boundaries/pggan_celebahq_gender_c_eyeglasses_boundary.npy?raw=true"
+pose_boundary_url = r"https://github.com/genforce/interfacegan/blob/master/boundaries/pggan_celebahq_pose_boundary.npy?raw=true"
+quality_boundary_url = r"https://github.com/genforce/interfacegan/blob/master/boundaries/pggan_celebahq_quality_boundary.npy?raw=true"
+smile_boundary_url = r"https://github.com/genforce/interfacegan/blob/master/boundaries/pggan_celebahq_smile_boundary.npy?raw=true"
+
+# load the boundary of your choice
+boundary_url = gender_boundary_url # replace with whichever you wish to load
+boundary = np.load( io.BytesIO( load_from_url(boundary_url) ) )
+### your code here
+
+# Sample a random latent
+z = np.random.randn(512).astype("float32")
+
+# Define alpha values (strength of editing)
+alphas = np.linspace(-3, 3, 11)
+
+# Generate edited latent vectors
+edited_latents = [z + alpha * boundary for alpha in alphas]
+
+faces = [generate_face(latent) for latent in edited_latents]
+
+# Plot
+fig, axes = plt.subplots(1, len(faces), figsize=(20, 4))
+for ax, face, alpha in zip(axes, faces, alphas):
+    ax.imshow(face)
+    ax.set_title(f"{alpha:.1f}")
+    ax.axis("off")
+plt.tight_layout()
+plt.show()
+
+"""# PART 2: Dataset
+
+Load in the (latents, responses) dataset. In this experiment, participants were shown faces generated by the model while their brain activity was recorded in an fMRI. This dataset consists of latents that generated the faces participants viewed in the scanner, and the brain activity responses that were recorded as a result of the viewing.
+
+Notice the shapes of the data arrays and become familiar with the data.
+"""
+
+subj1_file_id = r"1GYcje6YNbjzPchQTUJulcIIqDykUOioU"
+subj2_file_id = r"1kdi2U4uTMyFmZ3gfbZxb9u4V5PCtDxGX"
+subj_url = make_drive_downloadable_url(subj1_file_id)
+
+x_tr, t_tr, x_te, t_te = pickle.load( io.BytesIO( load_from_url(subj_url, name="subject_latents_and_responses.dat") ) )
+print((len(x_tr), len(x_te)), (len(t_tr), len(t_te)))
+print(len(x_tr[1]))
+
+data = pickle.load(io.BytesIO(load_from_url(subj_url, name="subject_latents_and_responses.dat")))
+
+print(type(data))
+print(len(t_tr[1]))
+
+"""## Exercise 5: Visual stimuli (5 points)
+
+Generate and visualise the faces that correspond to the latents from the test set. These were the visual stimuli in the experiment.
+
+Make sure to save all of the face-images to the respective train and test directory, e.g. by using the provided function
+"""
+
+def save_face(directory, face, face_id):
+  Image.fromarray(face, 'RGB').save(directory / f"{face_id}.png")
+
+t_tr = np.array(t_tr)
+t_te = np.array(t_te)
+print(t_tr.shape, t_te.shape)
+
+test_dir = __working_directory / "test"
+train_dir = __working_directory / "train"
+
+test_dir.mkdir(parents=True, exist_ok=True)
+train_dir.mkdir(parents=True, exist_ok=True)
+
+def generate_face(latent_vector):
+    latent_input = latent_vector[np.newaxis, :]
+    face = generator(nd.array(latent_input).as_in_context(ctx), 9).asnumpy()
+    face = np.clip(np.rint(127.5 * face + 127.5), 0.0, 255.0).astype("uint8").transpose(0, 2, 3, 1)[0]
+    return face
+
+def generate_face(latent_vector):
+    latent_input = np.expand_dims(latent_vector.astype("float32"), axis=0)
+    latent_nd = nd.array(latent_input, ctx=ctx)
+    face = generator(latent_nd, 9).asnumpy()
+    face = np.clip(np.rint(127.5 * face + 127.5), 0.0, 255.0).astype("uint8")
+    face = face.transpose(0, 2, 3, 1)[0]
+    return face
+
+# # Training set
+for i, latent in enumerate(t_tr):
+    face = generate_face(latent)
+    save_face(train_dir, face, f"train_{i}")
+
+# Test set
+for i, latent in enumerate(t_te):
+    face = generate_face(latent)
+    save_face(test_dir, face, f"test_{i}")
+
+# Number of faces to show
+N = 36
+cols = 6
+rows = N // cols
+
+fig, axes = plt.subplots(rows, cols, figsize=(3 * cols, 3 * rows))
+for i, ax in enumerate(axes.flat):
+    img_path = test_dir / f"test_{i}.png"
+    img = Image.open(img_path)
+    ax.imshow(img)
+    ax.set_title(f"test_{i}")
+    ax.axis("off")
+
+plt.tight_layout()
+plt.show()
+
+"""## Exercise 6: Brain responses (10 points)
+
+We are going to plot the neural responses on the brain using [Nilearn's glass brain plotting](https://nilearn.github.io/dev/auto_examples/01_plotting/plot_demo_glass_brain.html).
+
+First, take the mean brain response of all the training set responses using np.mean().
+
+Second, use the mask coordinates to bring the 1D (4096) responses back to 3D (79, 95, 79).
+
+Lastly, use the affine transformation matrix from the atlas to align the responses on the glass brain visualization.
+"""
+
+x_tr = np.array(x_tr)
+x_te = np.array(x_te)
+print("Training set:", x_tr.shape, "Test set:", x_te.shape)
+
+mask_coords_file_id = r"1aElSThEakHFmuWS9zoSPNfh2-1CySExA"
+atlas_mni_file_id = r"1eFUf0sjAdqDNZZsiLPgP_5cvNS5yuqNQ"
+mask_coords_url = make_drive_downloadable_url(mask_coords_file_id)
+atlas_mni_url = make_drive_downloadable_url(atlas_mni_file_id)
+
+coords = np.load(io.BytesIO( load_from_url(mask_coords_url, name="mask_coordinates.npy") ))
+load_from_url(atlas_mni_url, name="glass_atlas.nii")
+atlas = nib.Nifti1Image.load(get_downloaded_file_path(name="glass_atlas.nii"))
+
+mu_tr = np.mean(x_tr, axis=0)
+atlas.shape, coords.shape, mu_tr.shape
+
+### your code here
+brain_data = np.zeros(atlas.shape)
+
+for i, (x, y, z) in enumerate(coords):
+    brain_data[int(x), int(y), int(z)] = mu_tr[i]
+
+print(brain_data.shape)
+
+#  Get affine matrix from the atlas
+affine = atlas.affine
+
+# Create a new NIfTI image
+mu_brain_img = nib.Nifti1Image(brain_data, affine)
+
+# Plot
+plotting.plot_glass_brain(mu_brain_img, display_mode='lyrz', colorbar=True, title='Mean brain response (training set)')
+plotting.show()
+
+"""## Exercise 7: Glasser brain atlas (5 points)
+
+Load in the [Glasser atlas](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4990127/) and visualize it using glass brain. You can use the plot_glass_brain and plot_roi functions.
+<br>
+<br>
+
+**Legend**
+
+Early and intermediate visual cortex:<br>
+1) Primary_Visual: 1.  
+2) Early_Visual: 4, 5, 6.   
+3) Dorsal_Stream_Visual: 13, 19, 3, 152, 16, 17.  
+4) Ventral_Stream_Visual: 7, 163, 22, 18, 153, 160, 154.  
+5) MT+_Complex_and_Neighboring_Visual_Areas: 158, 20, 21, 159, 156, 157, 23, 2, 138.     
+   
+Sensorimotor areas:<br>
+6) Somatosensory_and_Motor: 8, 53, 9, 51, 52.   
+7) Paracentral_Lobular_and_Mid_Cingulate: 40, 41, 55, 44, 43, 36, 39, 37.     
+8) Premotor: 54, 96, 10, 56, 78, 11.  
+9) Posterior_Opercular: 99, 113, 100, 101, 102, 105.      
+
+Auditory regions:<br>
+10) Early_Auditory: 24, 174, 173, 124, 104.   
+11) Auditory_Association: 175, 125, 129, 128, 130, 176, 123, 107.     
+12) Insular_and_Frontal_Opercular: 103, 178, 168, 167, 106, 115, 114, 116, 109, 111, 112, 110, 108, 169.  
+
+Temporal cortex:<br>
+13) Medial_Temporal: 120, 119, 118, 122, 126, 155, 127.  
+14) Lateral_Temporal: 137, 133, 177, 132, 136, 134, 172, 131, 135.     
+
+Posterior cortex:<br>
+15) Temporo-Parieto-Occipital_Junction: 139, 140, 141, 28, 25.   
+16) Superior_Parietal: 48, 95, 49, 117, 50, 47, 42, 45, 46, 29.  
+17) Inferior_Parietal: 143, 151, 150, 149, 148, 116, 147, 146, 145, 144.  
+18) Posterior_Cingulate: 142, 121, 31, 15, 14, 33, 34, 35, 161, 162, 32, 38, 27, 30.     
+
+Anterior cortex:<br>
+19) Anterior_Cingulate_and_Medial_Prefrontal: 58, 57, 59, 180, 61, 60, 179, 62, 64, 165, 63, 69, 88, 65, 164.   
+20) Orbital_and_Polar_Frontal: 94, 66, 77, 91, 92, 89, 170, 90, 72, 93, 166.   
+21) Inferior_Frontal: 74, 75, 80, 79, 81, 82, 76, 171.   
+22) Dorsolateral_Prefrontal: 73, 67, 97, 98, 26, 70, 71, 87, 68, 83, 85, 84, 86.*
+
+"""
+
+### your code here
+# Step 1: Load Glasser atlas image
+glasser_img = atlas
+glasser_data = glasser_img.get_fdata()
+
+# Step 2: Region labels (visual cortex areas from the legend)
+visual_region_labels = [
+    1,             # Primary_Visual
+    4, 5, 6,       # Early_Visual
+    13, 19, 3, 152, 16, 17,
+    7, 163, 22, 18, 153, 160, 154,
+    158, 20, 21, 159, 156, 157, 23, 2, 138
+]
+
+sensorimotor_region_labels = [
+    # 6) Somatosensory and Motor
+    8, 53, 9, 51, 52,
+    # 7) Paracentral Lobular and Mid Cingulate
+    40, 41, 55, 44, 43, 36, 39, 37,
+    # 8) Premotor
+    54, 96, 10, 56, 78, 11,
+    # 9) Posterior Opercular
+    99, 113, 100, 101, 102, 105
+]
+
+
+# Step 3: Mask these regions
+roi_mask_vis = np.isin(glasser_data, visual_region_labels).astype(int)
+roi_img_vis = nib.Nifti1Image(roi_mask_vis.astype("float32"), affine=glasser_img.affine)
+
+roi_mask_sen = np.isin(glasser_data, sensorimotor_region_labels).astype(int)
+roi_img_sen = nib.Nifti1Image(roi_mask_sen.astype("float32"), affine=glasser_img.affine)
+
+
+# Step 4: Plot
+plotting.plot_glass_brain(roi_img_vis, display_mode='lyrz', colorbar=False, title='Early & Intermediate Visual Cortex')
+plotting.plot_glass_brain(roi_img_sen, display_mode='lyrz', colorbar=False, title='Sensorimotor areas')
+plotting.show()
+
+"""# PART 3: Neural encoding
+
+## Exercise 8: Stimulus-feature model (10 points)
+
+[Alexnet](https://papers.nips.cc/paper_files/paper/2012/file/c399862d3b9d6b76c8436e924a68c45b-Paper.pdf) is one of the first ridiculously successfull computer vision models. Check the authors of the paper and see if you recognise a name 😉.
+
+These days, pretrained model weights are widely avaiable online to avoid training the same models for the same tasks over and over again.
+The parameters you will be loading are from an AlexNet that was trained to categorize [ImageNet](https://www.image-net.org) images.
+
+We can extract the models intermediate feature representations to images.
+
+Feed the images from the training and test set to the model and extract the feature representations from multiple layers. Save them as numpy arrays.
+"""
+
+alex_net_params_file_id = r"1iqtJjDbRM9zlYNf-V_ZNnoCV7GGoFAvq"
+alex_net_params_url = make_drive_downloadable_url(alex_net_params_file_id)
+
+load_from_url(alex_net_params_url, name="alex_net.params")
+alex_net_params_path = get_downloaded_file_path(name="alex_net.params")
+
+class Alexnet(HybridBlock):
+    def __init__(self, layer: int) -> None:
+        super(Alexnet, self).__init__()
+        self.layer = layer
+        with self.name_scope():
+            self.features = nn.HybridSequential("")
+            with self.features.name_scope():
+                if layer >= 1:
+                    self.features.add(nn.Conv2D(64, 11, 4, 2, activation="relu"))
+                    self.features.add(nn.MaxPool2D(3, 2))
+                if layer >= 2:
+                    self.features.add(nn.Conv2D(192, 5, padding=2, activation="relu"))
+                    self.features.add(nn.MaxPool2D(3, 2))
+                if layer >= 3:
+                    self.features.add(nn.Conv2D(384, 3, padding=1, activation="relu"))
+                if layer >= 4:
+                    self.features.add(nn.Conv2D(256, 3, padding=1, activation="relu"))
+                if layer >= 5:
+                    self.features.add(nn.Conv2D(256, 3, padding=1, activation="relu"))
+                    self.features.add(nn.MaxPool2D(3, 2))
+                if layer >= 6:
+                    self.features.add(nn.Flatten())
+                    self.features.add(nn.Dense(4096, activation="relu"))
+                    self.features.add(nn.Dropout(0.5))
+                if layer >= 7:
+                    self.features.add(nn.Dense(4096, activation="relu"))
+                    self.features.add(nn.Dropout(0.5))
+            if layer == 8:
+                self.output = nn.Dense(1000)
+        self.load_parameters(alex_net_params_path, ctx, ignore_extra=True)
+
+    def transform(self, image):
+        resized = mx.image.resize_short(image, 224)
+        cropped, crop_info = mx.image.center_crop(resized, (224, 224))
+        normalized = mx.image.color_normalize(cropped.astype(np.float32)/255,
+                                        mean=mx.nd.array([0.485, 0.456, 0.406]),
+                                        std=mx.nd.array([0.229, 0.224, 0.225]))
+        transposed = normalized.transpose((2, 0, 1))
+        batchified = transposed.expand_dims(axis=0)
+        return batchified.as_in_context(ctx)
+
+    def hybrid_forward(self, F: ModuleType, x: nd.NDArray) -> nd.NDArray:
+        x = self.transform(x)
+        return self.output(self.features(x)) if self.layer == 8 else self.features(x)
+
+# Example: feed stimulus 0.png to alexnet and extract the feature representation from layer 1.
+# this example assumes you saved your test images into the test directory and
+# used a simple count as file name, so we are loading the image "0.png"
+# if you used a different naming scheme, change the code to reflect that
+layers = [1]
+for layer in layers:
+    feature_model = Alexnet(layer)
+    stimulus = mx.image.imread(test_dir / "test_0.png")
+    feature = feature_model(stimulus).asnumpy()
+    print(stimulus.shape, feature.shape)
+
+feature_dir = __working_directory / "features"
+feature_dir.mkdir(exist_ok=True, parents=True)
+
+layers = [1, 2, 3, 4, 5, 6, 7]
+n_train = len(t_tr)
+n_test = len(t_te)
+
+# Loop through all layers
+for layer in layers:
+    feature_model = Alexnet(layer)
+
+    # Train set
+    for i in range(n_train):
+        stimulus = mx.image.imread(train_dir / f"train_{i}.png")
+        feature = feature_model(stimulus).asnumpy()
+        out_name = f"train_{i}_layer{layer}.npy"
+        np.save(feature_dir / out_name, feature)
+
+    # Test set
+    for i in range(n_test):
+        stimulus = mx.image.imread(test_dir / f"test_{i}.png")
+        feature = feature_model(stimulus).asnumpy()
+        out_name = f"test_{i}_layer{layer}.npy"
+        np.save(feature_dir / out_name, feature)
+
+"""## Exercise 9: Feature-response model (10 points)
+
+Fit a linear feature-response model on the extracted Alexnet features and responses from the training set using [Scikit's RidgeCV](https://scikit-learn.org/stable/modules/generated/sklearn.linear_model.RidgeCV.html) (play around with different alpha values). Specifically, you are asked to use the features from the previous exercise to predict the brain activity given in the dataset.
+
+You could train different models for the voxels of different brain regions according to the Glasser atlas, but the main goal is to understand how to implement encoding models from feature representations. Train $k$ different models on features from $k$ different Alexnet layers.
+
+Evaluate the predicted responses versus the real responses from the test set using pearson_correlation_coefficient() per voxel (i.e., each voxel has its own correlation coefficient). In the end, you should have $k$ correlation coefficients per voxel response, and assign the layer that resulted in the highest correlation coefficient to each voxel.
+
+Plot the your results (e.g., assigned layers or correlation coefficients, depending on what you're interested in) on the glass brain visualization.
+"""
+
+def pearson_correlation_coefficient(x: np.ndarray, y: np.ndarray, axis: int) -> np.ndarray:
+    r = (np.nan_to_num(zscore(x)) * np.nan_to_num(zscore(y))).mean(axis)
+    p = 2 * t.sf(np.abs(r / np.sqrt((1 - r ** 2) / (x.shape[0] - 2))), x.shape[0] - 2)
+    return r, p
+
+print("x_tr, x_te,   t_tr, t_te  :", x_tr.shape, x_te.shape, t_tr.shape, t_te.shape)
+print("atlas.shape, coords.shape :", atlas.shape, coords.shape)
+
+# Set up
+layers     = [1, 2, 3, 4, 5, 6, 7]
+n_voxels   = x_te.shape[1]
+best_r     = np.full(n_voxels, -np.inf)
+best_layer = np.zeros(n_voxels, dtype=int)
+
+# Loop through each AlexNet layer
+for layer in layers:
+    print(f"→ Layer {layer}")
+    # Load and flatten features for train & test
+    X_train = np.stack([
+        np.load(feature_dir / f"train_{i}_layer{layer}.npy").flatten()
+        for i in range(len(x_tr))
+    ])
+    X_test = np.stack([
+        np.load(feature_dir / f"test_{i}_layer{layer}.npy").flatten()
+        for i in range(len(x_te))
+    ])
+
+    # Fit RidgeCV to predict brain (x_tr)
+    model = RidgeCV(alphas=[0.1, 1.0, 10.0])
+    model.fit(X_train, x_tr)
+    preds = model.predict(X_test)  # shape = (n_test, n_voxels)
+
+    # Compute per‐voxel Pearson r
+    r_vals, _ = pearson_correlation_coefficient(preds, x_te, axis=0)
+
+    # Update best_r / best_layer
+    mask = r_vals > best_r
+    best_r[mask]     = r_vals[mask]
+    best_layer[mask] = layer
+
+# Map back into 3D volumes
+r_brain     = np.zeros(atlas.shape)
+layer_brain = np.zeros(atlas.shape)
+
+for idx, (x, y, z) in enumerate(coords):
+    r_brain[int(x), int(y), int(z)]     = best_r[idx]
+    layer_brain[int(x), int(y), int(z)] = best_layer[idx]
+
+# Convert to NIfTI and plot
+r_img     = nib.Nifti1Image(r_brain, affine=atlas.affine)
+layer_img = nib.Nifti1Image(layer_brain.astype(np.uint8), affine=atlas.affine)
+
+print("▶ Best correlation per voxel")
+plotting.plot_glass_brain(
+    r_img,
+    display_mode='lyrz',
+    colorbar=True,
+    title="Best Pearson r per voxel"
+)
+plotting.show()
+
+print("▶ Best AlexNet layer per voxel")
+plotting.plot_glass_brain(
+    layer_img,
+    display_mode='lyrz',
+    colorbar=True,
+    title="Best layer per voxel"
+)
+plotting.show()
+
+"""# PART 4: Neural decoding
+
+## Exercise 10: response-latent model (10 points)
+
+Fit a linear response-feature decoding model that predicts GAN latents from brain responses. How does your model performance change as a function of regularization? Make sure to vary your regularization parameter and show how reconstruction performance changes as a function of it.
+"""
+
+from sklearn.metrics import mean_squared_error
+from scipy.stats import zscore
+from sklearn.linear_model import Ridge
+
+# Prepare data
+X_train, Y_train = x_tr, t_tr
+X_test,  Y_test  = x_te, t_te
+
+# Alphas to sweep
+alphas = [0.01, 0.1, 1, 10, 100, 1000, 10000]
+mses, corrs = [], []
+
+def pearson_r(a, b):
+    a_z = zscore(a, axis=0); b_z = zscore(b, axis=0)
+    return np.mean(a_z * b_z)
+
+for α in alphas:
+    model = Ridge(alpha=α)
+    model.fit(X_train, Y_train)
+    Y_pred = model.predict(X_test)
+
+    mses.append(mean_squared_error(Y_test, Y_pred))
+    r_vals, _ = pearson_correlation_coefficient(Y_pred, Y_test, axis=0)
+    corrs.append(r_vals.mean())
+
+# Find best alpha by lowest MSE or highest Pearson r
+best_idx = np.argmin(mses)  # or np.argmax(corrs), depending on your metric
+best_alpha = alphas[best_idx]
+
+# Train best_model with best_alpha on full train set
+best_model = Ridge(alpha=best_alpha)
+best_model.fit(X_train, Y_train)
+
+
+# Plot
+fig, (ax1, ax2) = plt.subplots(1,2, figsize=(8,3))
+
+ax1.semilogx(alphas, mses, 'o-')
+ax1.set(xlabel='alpha', ylabel='MSE (latents)', title='Reconstruction MSE vs. α')
+
+ax2.semilogx(alphas, corrs, 's-', color='C1')
+ax2.set(xlabel='alpha', ylabel='mean Pearson r', title='Decoding r vs. α')
+
+plt.tight_layout()
+plt.show()
+
+"""## Exercise 11: reconstruction (10 points)
+
+Feed your predicted latents to the generator and report your reconstruction performance (e.g., feature similarity or pearson's correlation coefficient over pixels). Show the faces generated by the target latents and the faces generated by your predicted latents.
+"""
+
+### your code here
+from scipy.spatial.distance import cosine
+
+def latent_to_image(z_np):
+    """Convert latent vector to image using generator"""
+    z_mx = nd.array(z_np.reshape(1, -1), ctx=ctx)
+    img = generator(z_mx, 9)[0]
+    img = img.transpose((1, 2, 0)).asnumpy()
+    img = np.clip((img + 1) * 127.5, 0, 255).astype(np.uint8)
+    return Image.fromarray(img)
+
+# Predict latent vectors from fMRI test data
+Y_pred = best_model.predict(X_test)  # best_model must be trained from Exercise 10
+
+# Generate images
+original_images  = [latent_to_image(z) for z in Y_test]
+reconstructed_images = [latent_to_image(z) for z in Y_pred]
+
+# Plot side-by-side
+n = 5
+fig, axes = plt.subplots(n, 2, figsize=(6, 2 * n))
+
+for i in range(n):
+    axes[i, 0].imshow(original_images[i])
+    axes[i, 0].set_title("Original")
+    axes[i, 1].imshow(reconstructed_images[i])
+    axes[i, 1].set_title("Reconstructed")
+    for ax in axes[i]: ax.axis('off')
+
+plt.tight_layout()
+plt.show()
+
+# Optional: Quantitative latent similarity
+latent_sim = [1 - cosine(Y_pred[i], Y_test[i]) for i in range(len(Y_pred))]
+print("Mean cosine similarity (latent space):", np.mean(latent_sim))
+
+"""# PART 5: Your experiment
+
+## Exercise 12: report (20 points)
+
+Now that you have mastered the basics, you can perform your own experiment with this dataset of brain responses to synthesized stimuli. Write an "ultra-short" (800-1,600 words) report on your experiment where you state your research question, methods, results and discussion.
+
+### Food for thought / research ideas:
+
+*   Improve reconstructions with a custom loss function. In addition to mean squared error between predicted and real latent, also add other loss terms (e.g., structural similarity index, Alexnet/VGGFace features)
+
+*   Linear interpolation of fMRI responses
+*   Vector arithmetic with fMRI responses
+*   Neural encoding using VGGFace features for face recognition
+*   Neural encoding: predict custum face attributes (e.g., emotional expression) by averaging many latents (as in exercise 3) or training your own SVM (as in exercise 4).
+*   Neural encoding / decoding from voxels in specific brain areas according to the Glasser atlas
+
+
+
+
+
+
+
+
+
+"""
+
+from skimage.metrics import structural_similarity as ssim  # for similarity
+
+voxel_coords = coords
+
+# Mapping each voxel to a Glasser ROI label
+roi_labels = [int(glasser_data[tuple(c)]) for c in voxel_coords]
+
+# Defining voxel masks per decoding level
+levels = {
+    "Level 1 (V1 only)": [1],
+    "Level 2 (V1–V3)": [1, 4, 5],
+    "Level 3 (V1–V4+LOC+FFA)": [1, 4, 5, 6, 152, 153],
+    "Level 4 (All)": "all"
+}
+
+# Define SSIM function for evaluation
+def compute_ssim(img1, img2):
+    img1_gray = np.asarray(img1.convert("L"), dtype=np.float32)
+    img2_gray = np.asarray(img2.convert("L"), dtype=np.float32)
+    score, _ = ssim(img1_gray, img2_gray, full=True, data_range=255.0)
+    return score
+
+# Shared original image reconstructions from t_te
+original_images = [latent_to_image(z) for z in t_te]
+
+# Decoding + evaluation
+def decode_and_reconstruct(level_name, region_ids, original_images):
+    if region_ids == "all":
+        X_train, X_test = x_tr, x_te
+    else:
+        mask = np.isin(roi_labels, region_ids)
+        X_train = x_tr[:, mask]
+        X_test = x_te[:, mask]
+
+    model = Ridge(alpha=best_alpha)
+    model.fit(X_train, t_tr)
+    Y_pred = model.predict(X_test)
+
+    # Reconstruct
+    reconstructed_images = [latent_to_image(z) for z in Y_pred]
+
+    # Evaluating SSIM and latent similarity
+    ssims = [compute_ssim(original_images[i], reconstructed_images[i]) for i in range(len(t_te))]
+    latent_sim = [1 - cosine(Y_pred[i], t_te[i]) for i in range(len(t_te))]
+
+    print(f"{level_name} - Avg SSIM: {np.mean(ssims):.3f}, Latent Sim: {np.mean(latent_sim):.3f}")
+
+    return reconstructed_images, ssims, latent_sim
+
+# Decoding for all levels
+results = {}
+for name, roi_list in levels.items():
+    print(f"\n===== {name} =====")
+    images, ssims, lat_sim = decode_and_reconstruct(name, roi_list, original_images)
+    results[name] = {
+        "images": images,
+        "ssim": ssims,
+        "latent_sim": lat_sim
+    }
+
+# Plotting SSIM and Latent Similarity Scores
+level_names = list(levels.keys())
+mean_ssims = [np.mean(results[name]['ssim']) for name in level_names]
+mean_latents = [np.mean(results[name]['latent_sim']) for name in level_names]
+x = np.arange(len(level_names))
+
+plt.figure(figsize=(10, 4))
+
+plt.subplot(1, 2, 1)
+plt.bar(x, mean_ssims, color='skyblue')
+plt.xticks(x, level_names, rotation=45)
+plt.ylabel("SSIM")
+plt.title("Structural Similarity by ROI Level")
+
+plt.subplot(1, 2, 2)
+plt.bar(x, mean_latents, color='orange')
+plt.xticks(x, level_names, rotation=45)
+plt.ylabel("Latent Cosine Similarity")
+plt.title("Latent Similarity by ROI Level")
+
+plt.tight_layout()
+plt.show()
+
+# Plotting Reconstructed Images
+n = 10  # number of test samples to visualize
+fig, axes = plt.subplots(n, len(level_names) + 1, figsize=(15, 3 * n))
+
+for i in range(n):
+    axes[i, 0].imshow(original_images[i])
+    axes[i, 0].set_title("Original")
+    axes[i, 0].axis('off')
+
+    for j, name in enumerate(level_names):
+        axes[i, j + 1].imshow(results[name]["images"][i])
+        clean_name = name.split("(")[-1].split(")")[0]  # e.g., "V1 only"
+        axes[i, j + 1].set_title(clean_name)
+        axes[i, j + 1].axis('off')
+
+plt.tight_layout()
+plt.show()
+
